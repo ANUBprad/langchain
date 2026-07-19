@@ -196,7 +196,11 @@ def _resolve_gateway_base_url() -> str | None:
 
 
 def _resolve_gateway_api_key() -> SecretStr | None:
-    return secret_from_env(_LANGSMITH_GATEWAY_API_KEY_ENV_VARS, default=None)()
+    for env_var in _LANGSMITH_GATEWAY_API_KEY_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            return SecretStr(value)
+    return None
 
 
 def _get_default_model_profile(model_name: str) -> ModelProfile:
@@ -1221,7 +1225,9 @@ class BaseChatOpenAI(BaseChatModel):
         sync_api_key_value: str | Callable[[], str] | None = None
         async_api_key_value: str | Callable[[], Awaitable[str]] | None = None
 
-        explicit_api_key = bool({"api_key", "openai_api_key"} & self.model_fields_set)
+        explicit_api_key = bool(
+            {"api_key", "openai_api_key"} & self.model_fields_set
+        ) and self.openai_api_key is not None
         if _base_url_from_gateway and not explicit_api_key:
             gateway_api_key = _resolve_gateway_api_key()
             if gateway_api_key is not None:

@@ -127,7 +127,11 @@ def _resolve_gateway_base_url() -> str | None:
 
 
 def _resolve_gateway_api_key() -> SecretStr | None:
-    return secret_from_env(_LANGSMITH_GATEWAY_API_KEY_ENV_VARS, default=None)()
+    for env_var in _LANGSMITH_GATEWAY_API_KEY_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            return SecretStr(value)
+    return None
 
 
 def _get_default_model_profile(model_name: str) -> ModelProfile:

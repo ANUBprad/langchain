@@ -4584,3 +4584,53 @@ def test_langsmith_gateway_api_key_not_used_without_gateway(
     llm = ChatOpenAI(model=OPENAI_TEST_MODEL)
     assert isinstance(llm.openai_api_key, SecretStr)
     assert llm.openai_api_key.get_secret_value() == "provider-key"
+
+
+def test_langsmith_gateway_empty_gateway_key_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGSMITH_GATEWAY", "true")
+    monkeypatch.setenv("LANGSMITH_GATEWAY_API_KEY", "")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "gateway")
+    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    llm = ChatOpenAI(model=OPENAI_TEST_MODEL)
+    assert isinstance(llm.openai_api_key, SecretStr)
+    assert llm.openai_api_key.get_secret_value() == "gateway"
+
+
+def test_langsmith_gateway_all_empty_keys_falls_to_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGSMITH_GATEWAY", "true")
+    monkeypatch.setenv("LANGSMITH_GATEWAY_API_KEY", "")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "")
+    monkeypatch.setenv("LANGCHAIN_API_KEY", "legacy")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    llm = ChatOpenAI(model=OPENAI_TEST_MODEL)
+    assert isinstance(llm.openai_api_key, SecretStr)
+    assert llm.openai_api_key.get_secret_value() == "legacy"
+
+
+def test_langsmith_gateway_no_gateway_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGSMITH_GATEWAY", "true")
+    monkeypatch.delenv("LANGSMITH_GATEWAY_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-key")
+    llm = ChatOpenAI(model=OPENAI_TEST_MODEL)
+    assert isinstance(llm.openai_api_key, SecretStr)
+    assert llm.openai_api_key.get_secret_value() == "provider-key"
+
+
+def test_langsmith_gateway_api_key_none_uses_gateway_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGSMITH_GATEWAY", "true")
+    monkeypatch.setenv("LANGSMITH_GATEWAY_API_KEY", "gateway-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    llm = ChatOpenAI(model=OPENAI_TEST_MODEL, api_key=None)
+    assert isinstance(llm.openai_api_key, SecretStr)
+    assert llm.openai_api_key.get_secret_value() == "gateway-key"
