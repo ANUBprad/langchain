@@ -1,6 +1,7 @@
 """Module that contains tests for runnable.astream_events API."""
 
 import asyncio
+import contextlib
 import inspect
 import sys
 import uuid
@@ -19,11 +20,14 @@ from typing_extensions import override
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun, Callbacks
 from langchain_core.callbacks.manager import (
+    CallbackManagerForLLMRun,
     adispatch_custom_event,
 )
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.documents import Document
 from langchain_core.language_models import FakeStreamingListLLM, GenericFakeChatModel
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.language_models.llms import BaseLLM
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -31,6 +35,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
 )
+from langchain_core.outputs import ChatResult, LLMResult
 from langchain_core.prompt_values import ChatPromptValue
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.retrievers import BaseRetriever
@@ -40,6 +45,7 @@ from langchain_core.runnables import (
     RunnableConfig,
     RunnableGenerator,
     RunnableLambda,
+    RunnableWithFallbacks,
     chain,
     ensure_config,
 )
@@ -50,7 +56,9 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.runnables.schema import StreamEvent
 from langchain_core.runnables.utils import Addable
 from langchain_core.tools import tool
+from langchain_core.tracers.event_stream import _AstreamEventsCallbackHandler
 from langchain_core.utils.aiter import aclosing
+from langchain_core.utils.uuid import uuid7
 from tests.unit_tests.runnables.test_runnable_events_v1 import (
     _assert_events_equal_allow_superset_metadata,
 )
@@ -1605,6 +1613,15 @@ async def test_chain_ordering() -> None:
     )
 
 
+class _EquatableError(ValueError):
+    """A `ValueError` that compares equal to any `ValueError` with the same message."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ValueError) and str(other) == str(self)
+
+    __hash__ = None
+
+
 async def test_event_stream_with_retry() -> None:
     """Test the event stream with a tool."""
 
@@ -1681,6 +1698,24 @@ async def test_event_stream_with_retry() -> None:
                 "run_id": "",
                 "parent_ids": [],
                 "tags": ["seq:step:1"],
+            },
+            {
+                "data": {"error": _EquatableError("fail"), "input": "success"},
+                "event": "on_chain_error",
+                "metadata": {},
+                "name": "fail",
+                "run_id": "",
+                "parent_ids": [],
+                "tags": ["seq:step:2"],
+            },
+            {
+                "data": {"error": _EquatableError("fail"), "input": "q"},
+                "event": "on_chain_error",
+                "metadata": {},
+                "name": "RunnableSequence",
+                "run_id": "",
+                "parent_ids": [],
+                "tags": [],
             },
         ],
     )
@@ -2916,3 +2951,228 @@ async def test_tool_error_event_tool_call_id_is_none_when_not_provided() -> None
     assert error_event["name"] == "failing_tool_no_id"
     assert "tool_call_id" in error_event["data"]
     assert error_event["data"]["tool_call_id"] is None
+
+
+class FailingChatModel(BaseChatModel):
+    """A chat model that always raises an error."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "failing-chat-model"
+
+    @override
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Always raise an error."""
+        msg = "Chat model failed"
+        raise ValueError(msg)
+
+
+class FailingLLM(BaseLLM):
+    """An LLM that always raises an error."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "failing-llm"
+
+    @override
+    def _generate(
+        self,
+        prompts: list[str],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> LLMResult:
+        """Always raise an error."""
+        msg = "LLM failed"
+        raise ValueError(msg)
+
+
+class FailingRetriever(BaseRetriever):
+    """A retriever that always raises an error."""
+
+    @override
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        """Always raise an error."""
+        msg = "Retriever failed"
+        raise ValueError(msg)
+
+
+async def _collect_events_with_raises(
+    runnable: Runnable, *args: Any
+) -> list[StreamEvent]:
+    """Collect events while the underlying runnable raises an exception."""
+    events: list[StreamEvent] = []
+
+    # Need to use async for loop to collect events before exception is raised.
+    # List comprehension would fail entirely when exception occurs.
+    async def collect_events() -> None:
+        async for event in runnable.astream_events(*args, version="v2"):
+            events.append(event)  # noqa: PERF401
+
+    with contextlib.suppress(Exception):
+        await collect_events()
+    return events
+
+
+async def test_chain_error_event_emitted() -> None:
+    """Test that a failing chain run emits an on_chain_error event."""
+    chain_runnable = RunnableLambda(lambda _: 1 / 0)
+
+    events = await _collect_events_with_raises(chain_runnable, "some input")
+
+    start_events = [e for e in events if e["event"] == "on_chain_start"]
+    error_events = [e for e in events if e["event"] == "on_chain_error"]
+    end_events = [e for e in events if e["event"].endswith("_end")]
+
+    assert len(start_events) == 1
+    assert len(error_events) == 1
+    assert not end_events
+
+    assert error_events[0]["run_id"] == start_events[0]["run_id"]
+    assert error_events[0]["name"] == start_events[0]["name"]
+    assert error_events[0]["parent_ids"] == []
+    assert isinstance(error_events[0]["data"]["error"], ZeroDivisionError)
+    assert error_events[0]["data"]["input"] == "some input"
+
+
+async def test_chat_model_error_event_emitted() -> None:
+    """Test that a failing chat model run emits an on_chat_model_error event."""
+    failing_chat_model = FailingChatModel()
+
+    events = await _collect_events_with_raises(
+        failing_chat_model, [HumanMessage(content="Hi")]
+    )
+
+    error_events = [e for e in events if e["event"] == "on_chat_model_error"]
+    assert len(error_events) == 1
+
+    error_event = error_events[0]
+    assert error_event["name"] == "FailingChatModel"
+    assert isinstance(error_event["data"]["error"], ValueError)
+    assert str(error_event["data"]["error"]) == "Chat model failed"
+    assert error_event["data"]["input"] == {"messages": [[HumanMessage(content="Hi")]]}
+
+    assert "on_chat_model_end" not in [e["event"] for e in events]
+
+
+async def test_llm_error_event_emitted() -> None:
+    """Test that a failing LLM run emits an on_llm_error event."""
+    failing_llm = FailingLLM()
+
+    events = await _collect_events_with_raises(failing_llm, "Write a poem")
+
+    error_events = [e for e in events if e["event"] == "on_llm_error"]
+    assert len(error_events) == 1
+
+    error_event = error_events[0]
+    assert error_event["name"] == "FailingLLM"
+    assert isinstance(error_event["data"]["error"], ValueError)
+    assert str(error_event["data"]["error"]) == "LLM failed"
+    assert error_event["data"]["input"] == {"prompts": ["Write a poem"]}
+
+    assert "on_llm_end" not in [e["event"] for e in events]
+
+
+async def test_retriever_error_event_emitted() -> None:
+    """Test that a failing retriever run emits an on_retriever_error event."""
+    failing_retriever = FailingRetriever()
+
+    events = await _collect_events_with_raises(failing_retriever, "hello")
+
+    error_events = [e for e in events if e["event"] == "on_retriever_error"]
+    assert len(error_events) == 1
+
+    error_event = error_events[0]
+    assert error_event["name"] == "FailingRetriever"
+    assert isinstance(error_event["data"]["error"], ValueError)
+    assert str(error_event["data"]["error"]) == "Retriever failed"
+    assert error_event["data"]["input"] == {"query": "hello"}
+
+    assert "on_retriever_end" not in [e["event"] for e in events]
+
+
+async def test_error_event_terminates_failed_run_in_fallbacks() -> None:
+    """Test that a failed child run is terminated before a fallback recovers."""
+    failing = RunnableLambda(lambda _: 1 / 0)
+    recovering = RunnableLambda(lambda _: "recovered")
+    runnable = RunnableWithFallbacks(runnable=failing, fallbacks=[recovering])
+
+    events = await _collect_events_with_raises(runnable, "some input")
+
+    run_events: dict[str, list[str]] = {}
+    for event in events:
+        run_events.setdefault(event["run_id"], []).append(event["event"])
+
+    failed_events = [e for e in events if e["event"] == "on_chain_error"]
+    assert len(failed_events) == 1
+
+    failed_run_events = run_events[failed_events[0]["run_id"]]
+    assert failed_run_events == ["on_chain_start", "on_chain_error"]
+
+    for run_id, other_run_events in run_events.items():
+        if run_id == failed_events[0]["run_id"]:
+            continue
+        assert any(event.endswith("_end") for event in other_run_events)
+
+    recovered_events = [e for e in events if e["event"] == "on_chain_end"]
+    assert len(recovered_events) >= 1
+    assert any(e["data"]["output"] == "recovered" for e in recovered_events)
+
+
+async def test_error_handlers_pop_run_map() -> None:
+    """Test that chain/LLM/retriever error handlers clean up the run map."""
+    handler = _AstreamEventsCallbackHandler()
+
+    chain_run_id = uuid7()
+    await handler.on_chain_start(
+        None,
+        {"input": "in"},
+        run_id=chain_run_id,
+        parent_run_id=None,
+        tags=[],
+        metadata={},
+        run_type="chain",
+        name="failing chain",
+    )
+    assert chain_run_id in handler.run_map
+
+    await handler.on_chain_error(ValueError("boom"), run_id=chain_run_id)
+    assert chain_run_id not in handler.run_map
+
+    llm_run_id = uuid7()
+    await handler.on_llm_start(
+        {},
+        ["Write a poem"],
+        run_id=llm_run_id,
+        parent_run_id=None,
+        tags=[],
+        metadata={},
+        name="failing llm",
+    )
+    assert llm_run_id in handler.run_map
+
+    await handler.on_llm_error(ValueError("boom"), run_id=llm_run_id)
+    assert llm_run_id not in handler.run_map
+
+    retriever_run_id = uuid7()
+    await handler.on_retriever_start(
+        {},
+        "hello",
+        run_id=retriever_run_id,
+        parent_run_id=None,
+        tags=[],
+        metadata={},
+        name="failing retriever",
+    )
+    assert retriever_run_id in handler.run_map
+
+    await handler.on_retriever_error(ValueError("boom"), run_id=retriever_run_id)
+    assert retriever_run_id not in handler.run_map
